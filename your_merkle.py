@@ -24,12 +24,15 @@ SNAPSHOT_SUFFIX = ".your-merkle.snapshot"
 def sha256_combine_commutative(h1: bytes, h2: bytes) -> bytes:
     """
     Combine two 32-byte SHA-256 digests commutatively.
-    Returns SHA256(sorted(h1,h2) concatenated).
+    Converts to hex strings, concatenates in sorted order, then hashes.
     """
     if len(h1) != 32 or len(h2) != 32:
         raise ValueError("Inputs must be 32-byte SHA-256 digests")
-    a, b = (h1, h2) if h1 <= h2 else (h2, h1)
-    return hashlib.sha256(a + b).digest()
+    hex1, hex2 = h1.hex(), h2.hex()
+    a, b = (hex1, hex2) if hex1 <= hex2 else (hex2, hex1)
+    combined = a + b
+    result = hashlib.sha256(combined.encode('ascii')).digest()
+    return result
 
 
 def hash_file(filepath: Path) -> bytes:
@@ -229,13 +232,14 @@ def prove(tophash_hex: str, filepath: Path) -> None:
     # Verify we got the right tophash
     if final_hash != tophash:
         raise Exception("computed tophash does not match provided tophash (snapshot may be corrupt)")
+
+    print(f"File hash: {target_hash.hex()}")
+    print(f"Tophash  : {tophash_hex}")
     
     # Output the proof chain
-    print(f"--- Proof for file hash ---")
-    print(target_hash.hex())  # file hash
+    print(f"--- Start proof ---")
     for h in final_chain:
         print(h.hex())
-    print(f"{tophash_hex}")
     print("--- End proof ---")
 
 
