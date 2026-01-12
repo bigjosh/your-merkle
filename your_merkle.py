@@ -49,6 +49,16 @@ def is_hidden(path: Path) -> bool:
     return False
 
 
+def derive_file_salt(master_salt: bytes, file_hash: bytes) -> bytes:
+    """
+    Derive a file-specific salt from the master salt and file hash.
+    This allows storing only the master salt instead of per-file salts.
+    """
+    if len(master_salt) != 32 or len(file_hash) != 32:
+        raise ValueError("master_salt and file_hash must be 32 bytes each")
+    return hashlib.sha256(master_salt + file_hash).digest()
+
+
 def iter_files(root: Path):
     """
     Iterate over all non-hidden files in the directory tree.
@@ -68,40 +78,51 @@ def capture(root: Path) -> None:
     """
     Capture the state of all files in the directory tree.
     Creates a snapshot file and prints the tophash.
+
+    Snapshot format:
+    - First 32 bytes: master salt (random, generated once per snapshot)
+    - Remaining bytes: file hashes (32 bytes each)
+
+    File-specific salts are derived deterministically from master_salt + file_hash.
     """
     # Stack for building the Merkle tree: list of (size, hash) tuples
     # size = number of leaves in the subtree
     stack: list[tuple[int, bytes]] = []
     file_count = 0
-    
+
+    # Generate a single master salt for the entire snapshot
+    master_salt = secrets.token_bytes(32)
+
     # Create temp file for snapshot data
     temp_fd, temp_path = tempfile.mkstemp()
     try:
         with os.fdopen(temp_fd, "wb") as temp_file:
+            # Write master salt at the beginning of the snapshot
+            temp_file.write(master_salt)
+
             for filepath in iter_files(root):
                 # Compute file hash
                 file_hash = hash_file(filepath)
-                
-                # Generate random unisalt
-                unisalt = secrets.token_bytes(32)
-                
-                # Write hash and unisalt to temp file (32 bytes each, big-endian)
+
+                # Derive file-specific salt from master salt
+                unisalt = derive_file_salt(master_salt, file_hash)
+
+                # Write only file hash to snapshot (salt is derived from master)
                 temp_file.write(file_hash)
-                temp_file.write(unisalt)
-                
+
                 # Combine hash and unisalt to create the leaf node
                 node = sha256_combine_commutative(file_hash, unisalt)
                 size = 1
-                
+
                 # Merge nodes of the same size
                 while stack and stack[-1][0] == size:
                     _, sibling_hash = stack.pop()
                     node = sha256_combine_commutative(node, sibling_hash)
                     size *= 2
-                
+
                 stack.append((size, node))
                 file_count += 1
-                
+
                 # Print status
                 print(f"[{file_count}] {filepath}")
         
@@ -140,41 +161,54 @@ def prove(tophash_hex: str, filepath: Path) -> None:
     """
     Generate a proof that a file is captured in a tophash.
     Prints the proof chain from file hash to tophash.
+
+    Snapshot format:
+    - First 32 bytes: master salt
+    - Remaining bytes: file hashes (32 bytes each)
+
+    File-specific salts are derived from master_salt + file_hash.
     """
     # Validate tophash format
     if len(tophash_hex) != 64:
         raise ValueError("tophash must be 64 hex characters")
     tophash = bytes.fromhex(tophash_hex)
-    
+
     # Hash the target file
     if not filepath.exists():
         raise FileNotFoundError(f"file not found: {filepath}")
-    
+
     target_hash = hash_file(filepath)
-    
+
     # Open snapshot file
     snapshot_filename = tophash_hex + SNAPSHOT_SUFFIX
     if not os.path.exists(snapshot_filename):
         raise FileNotFoundError(f"snapshot file for specified tophash not found: {snapshot_filename}")
-    
+
     # Read snapshot and rebuild the tree to find the proof path
     # We need to replay the tree construction and track the path for our target
-    
+
     # Stack for building the Merkle tree: list of (size, hash, proof_chain or None) tuples
     # size = number of leaves in subtree, proof_chain tracks sibling hashes if subtree contains target
     stack: list[tuple[int, bytes, list[bytes] | None]] = []
     found_target = False
     target_unisalt: bytes | None = None
-    
+
     with open(snapshot_filename, "rb") as f:
+        # Read master salt from the beginning of the snapshot
+        master_salt = f.read(32)
+        if len(master_salt) != 32:
+            raise ValueError("Corrupt snapshot file: missing or incomplete master salt")
+
         while True:
             file_hash = f.read(32)
             if not file_hash:
                 break
-            unisalt = f.read(32)
-            if len(unisalt) != 32:
-                raise ValueError("Corrupt snapshot file")
-            
+            if len(file_hash) != 32:
+                raise ValueError("Corrupt snapshot file: incomplete file hash")
+
+            # Derive file-specific salt from master salt
+            unisalt = derive_file_salt(master_salt, file_hash)
+
             # Check if this is our target file
             is_target = (file_hash == target_hash)
             if is_target:
@@ -184,25 +218,25 @@ def prove(tophash_hex: str, filepath: Path) -> None:
                 proof_chain: list[bytes] | None = [unisalt]
             else:
                 proof_chain = None
-            
+
             # Combine hash and unisalt to create the leaf node
             node = sha256_combine_commutative(file_hash, unisalt)
             size = 1
-            
+
             # Merge nodes of the same size
             while stack and stack[-1][0] == size:
                 _, sibling_hash, sibling_chain = stack.pop()
-                
+
                 # If either subtree contains our target, we need to track the sibling
                 if proof_chain is not None:
                     proof_chain.append(sibling_hash)
                 elif sibling_chain is not None:
                     proof_chain = sibling_chain
                     proof_chain.append(node)
-                
+
                 node = sha256_combine_commutative(node, sibling_hash)
                 size *= 2
-            
+
             stack.append((size, node, proof_chain))
     
     if not found_target:
